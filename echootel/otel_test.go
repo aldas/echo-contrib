@@ -1,4 +1,4 @@
-package otelecho
+package echootel
 
 import (
 	"fmt"
@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/labstack/echo-contrib/otelecho/extrator"
 	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -56,7 +57,7 @@ func TestPropagationWithGlobalPropagators(t *testing.T) {
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(r.Header))
 
 	router := echo.New()
-	router.Use(Middleware("foobar", WithTracerProvider(provider)))
+	router.Use(NewMiddlewareWithConfig(Config{ServerName: "foobar", TracerProvider: provider}))
 	router.GET("/user/:id", func(c *echo.Context) error {
 		span := trace.SpanFromContext(c.Request().Context())
 		assert.Equal(t, sc.TraceID(), span.SpanContext().TraceID())
@@ -87,7 +88,7 @@ func TestPropagationWithCustomPropagators(t *testing.T) {
 	b3.Inject(ctx, propagation.HeaderCarrier(r.Header))
 
 	router := echo.New()
-	router.Use(Middleware("foobar", WithTracerProvider(provider), WithPropagators(b3)))
+	router.Use(NewMiddlewareWithConfig(Config{ServerName: "foobar", TracerProvider: provider, Propagators: b3}))
 	router.GET("/user/:id", func(c *echo.Context) error {
 		span := trace.SpanFromContext(c.Request().Context())
 		assert.Equal(t, sc.TraceID(), span.SpanContext().TraceID())
@@ -108,7 +109,7 @@ func TestSkipper(t *testing.T) {
 	}
 
 	router := echo.New()
-	router.Use(Middleware("foobar", WithSkipper(skipper)))
+	router.Use(NewMiddlewareWithConfig(Config{ServerName: "foobar", Skipper: skipper}))
 	router.GET("/ping", func(c *echo.Context) error {
 		span := trace.SpanFromContext(c.Request().Context())
 		assert.False(t, span.SpanContext().HasSpanID())
@@ -122,45 +123,40 @@ func TestSkipper(t *testing.T) {
 
 func TestMetrics(t *testing.T) {
 	tests := []struct {
-		name                         string
-		metricAttributeExtractor     func(*http.Request) []attribute.KeyValue
-		echoMetricAttributeExtractor func(*echo.Context) []attribute.KeyValue
-		requestTarget                string
-		wantRouteAttr                string
-		wantStatus                   int64
+		name          string
+		givenConfig   Config
+		requestTarget string
+		wantRouteAttr string
+		wantStatus    int64
 	}{
 		{
-			name:                         "default",
-			metricAttributeExtractor:     nil,
-			echoMetricAttributeExtractor: nil,
-			requestTarget:                "/user/123",
-			wantRouteAttr:                "/user/:id",
-			wantStatus:                   200,
+			name:          "default",
+			requestTarget: "/user/123",
+			wantRouteAttr: "/user/:id",
+			wantStatus:    200,
 		},
 		{
 			// Note: In Echo v5, when a route is not found, the error type returned
 			// may not be *echo.HTTPError, so the middleware falls back to 500.
 			// The actual HTTP response to the client is still 404 (handled by HTTPErrorHandler),
 			// but the middleware captures the error status before HTTPErrorHandler runs.
-			name:                         "request target not exist",
-			metricAttributeExtractor:     nil,
-			echoMetricAttributeExtractor: nil,
-			requestTarget:                "/abc/123",
-			wantStatus:                   500,
+			name:          "request target not exist",
+			requestTarget: "/abc/123",
+			wantStatus:    500,
 		},
 		{
 			name: "with metric attributes callback",
-			metricAttributeExtractor: func(r *http.Request) []attribute.KeyValue {
-				return []attribute.KeyValue{
-					attribute.String("key1", "value1"),
-					attribute.String("key2", "value"),
-					attribute.String("method", strings.ToUpper(r.Method)),
-				}
-			},
-			echoMetricAttributeExtractor: func(_ *echo.Context) []attribute.KeyValue {
-				return []attribute.KeyValue{
-					attribute.String("key3", "value3"),
-				}
+			givenConfig: Config{
+				SpanStartAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+					return append(attr, attribute.String("key3", "value3"))
+				},
+				MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+					return append(attr,
+						attribute.String("key1", "value1"),
+						attribute.String("key2", "value"),
+						attribute.String("method", strings.ToUpper(c.Request().Method)),
+					)
+				},
 			},
 			requestTarget: "/user/123",
 			wantRouteAttr: "/user/:id",
@@ -173,12 +169,16 @@ func TestMetrics(t *testing.T) {
 			reader := sdkmetric.NewManualReader()
 			meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
+			config := tt.givenConfig
+			if config.ServerName != "" {
+				config.ServerName = "foobar"
+			}
+			if config.MeterProvider == nil {
+				config.MeterProvider = meterProvider
+			}
+
 			e := echo.New()
-			e.Use(Middleware("foobar",
-				WithMeterProvider(meterProvider),
-				WithMetricAttributeFn(tt.metricAttributeExtractor),
-				WithEchoMetricAttributeFn(tt.echoMetricAttributeExtractor),
-			))
+			e.Use(NewMiddlewareWithConfig(config))
 			e.GET("/user/:id", func(c *echo.Context) error {
 				id := c.Param("id")
 				assert.Equal(t, "123", id)
@@ -210,10 +210,12 @@ func TestMetrics(t *testing.T) {
 				attrs = append(attrs, attribute.String("http.route", tt.wantRouteAttr))
 			}
 
-			if tt.metricAttributeExtractor != nil {
-				attrs = append(attrs, tt.metricAttributeExtractor(r)...)
+			c := e.NewContext(r, w)
+
+			if tt.givenConfig.MetricAttributes != nil {
+				attrs = append(attrs, tt.givenConfig.MetricAttributes(c, &extrator.Values{}, attrs)...)
 			}
-			if tt.echoMetricAttributeExtractor != nil {
+			if tt.givenConfig.SpanStartAttributes != nil {
 				// In Echo v5, we don't need to create a mock context
 				// The attributes are already extracted during the actual request
 				attrs = append(attrs, attribute.String("key3", "value3"))
@@ -269,14 +271,17 @@ func TestWithMetricAttributeFn(t *testing.T) {
 	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
 	e := echo.New()
-	e.Use(Middleware("test-service",
-		WithMeterProvider(meterProvider),
-		WithMetricAttributeFn(func(r *http.Request) []attribute.KeyValue {
-			return []attribute.KeyValue{
-				attribute.String("custom.header", r.Header.Get("X-Test-Header")),
-			}
-		}),
-	))
+	e.Use(NewMiddlewareWithConfig(Config{
+		ServerName:    "test-service",
+		MeterProvider: meterProvider,
+		MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+			attr = append(
+				attr,
+				attribute.String("custom.header", c.Request().Header.Get("X-Test-Header")),
+			)
+			return attr
+		},
+	}))
 
 	e.GET("/test", func(c *echo.Context) error {
 		return c.String(http.StatusOK, "test response")
@@ -319,16 +324,19 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
 	e := echo.New()
-	e.Use(Middleware("test-service",
-		WithMeterProvider(meterProvider),
-		WithEchoMetricAttributeFn(func(c *echo.Context) []attribute.KeyValue {
-			return []attribute.KeyValue{
+	e.Use(NewMiddlewareWithConfig(Config{
+		ServerName:    "test-service",
+		MeterProvider: meterProvider,
+		MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+			attr = append(
+				attr,
 				// This is just for testing. Avoid high cardinality metrics such as "id" in production code
 				attribute.String("echo.param.id", c.Param("id")),
 				attribute.String("echo.path", c.Path()),
-			}
-		}),
-	))
+			)
+			return attr
+		},
+	}))
 
 	e.GET("/user/:id", func(c *echo.Context) error {
 		return c.String(http.StatusOK, "user: "+c.Param("id"))
@@ -372,24 +380,19 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 func TestWithOnError(t *testing.T) {
 	tests := []struct {
 		name              string
-		opt               Option
+		GivenOnErrorFunc  OnErrorFunc
 		wantHandlerCalled int
 	}{
 		{
 			name:              "without WithOnError option (default)",
-			opt:               nil,
-			wantHandlerCalled: 1,
-		},
-		{
-			name:              "nil WithOnError option",
-			opt:               WithOnError(nil),
+			GivenOnErrorFunc:  nil,
 			wantHandlerCalled: 1,
 		},
 		{
 			name: "custom onError logging only",
-			opt: WithOnError(func(_ *echo.Context, err error) {
+			GivenOnErrorFunc: func(_ *echo.Context, err error) {
 				t.Logf("Inside custom OnError: %v", err)
-			}),
+			},
 			wantHandlerCalled: 1,
 		},
 	}
@@ -400,11 +403,7 @@ func TestWithOnError(t *testing.T) {
 			w := httptest.NewRecorder()
 
 			router := echo.New()
-			if tt.opt != nil {
-				router.Use(Middleware("foobar", tt.opt))
-			} else {
-				router.Use(Middleware("foobar"))
-			}
+			router.Use(NewMiddlewareWithConfig(Config{ServerName: "foobar", OnError: tt.GivenOnErrorFunc}))
 
 			router.GET("/ping", func(_ *echo.Context) error {
 				return assert.AnError

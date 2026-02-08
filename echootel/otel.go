@@ -1,0 +1,250 @@
+package echootel
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/labstack/echo-contrib/otelecho/extrator"
+	"github.com/labstack/echo/v5"
+	"github.com/labstack/echo/v5/middleware"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
+)
+
+// opentelemetry HTTP spec: https://opentelemetry.io/docs/specs/semconv/http/
+// HTTP metrics spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
+
+// Version is the current release version of the echo instrumentation.
+const Version = "5.0.0"
+
+const (
+	tracerKey = "labstack-echo-otelecho-tracer"
+	// ScopeName is the instrumentation scope name.
+	ScopeName = "github.com/labstack/echo-contrib/echootel"
+)
+
+// Config is used to configure the middleware.
+type Config struct {
+	// ServerName is set as `server.address` and `server.port` for span and metrics attributes.
+	// Example: "api.example.com" or "example.com:8080"
+	//
+	// If known, this value must be set to the server’s canonical (primary) name.
+	// For example, in Apache this corresponds to the ServerName directive
+	// (https://httpd.apache.org/docs/2.4/mod/core.html#servername), and in NGINX
+	// to the server_name directive
+	// (http://nginx.org/en/docs/http/ngx_http_core_module.html#server_name).
+	//
+	// More generally, the primary server name is the host header value that maps
+	// to the HTTP server’s default virtual host. It must include the hostname,
+	// and if the server is accessed via a non-default port, the port must be
+	// appended using the standard ":port" suffix.
+	//
+	// If the primary server name is unknown, this field should be set to an
+	// empty string. In that case, Request.Host will be used to resolve the
+	// effective server name and port.
+	ServerName string
+
+	// Skipper defines a function to skip middleware.
+	Skipper middleware.Skipper
+
+	// OnErrorFn is used to specify how errors are handled in the middleware.
+	OnError OnErrorFunc
+
+	TracerProvider oteltrace.TracerProvider
+	MeterProvider  metric.MeterProvider
+	Propagators    propagation.TextMapPropagator
+
+	// SpanStartOptions configures an additional set of trace.SpanStartOptions, which are applied to each new span.
+	SpanStartOptions []oteltrace.SpanStartOption
+
+	// SpanStartAttributes is used to extract additional attributes from the echo.Context
+	// and return them as a slice of attribute.KeyValue.
+	SpanStartAttributes AttributesFunc
+
+	// SpanEndAttributes is used to extract additional attributes from the echo.Context
+	// and return them as a slice of attribute.KeyValue.
+	SpanEndAttributes AttributesFunc
+
+	// MetricAttributes is used to extract additional attributes from the echo.Context
+	// and return them as a slice of attribute.KeyValue.
+	MetricAttributes AttributesFunc
+}
+
+// AttributesFunc is used to extract additional attributes from the echo.Context
+// and return them as a slice of attribute.KeyValue.
+type AttributesFunc func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue
+
+// OnErrorFunc is used to specify how errors are handled in the middleware.
+type OnErrorFunc func(c *echo.Context, err error)
+
+func NewMiddleware(serverName string) echo.MiddlewareFunc {
+	return NewMiddlewareWithConfig(Config{ServerName: serverName})
+}
+
+func NewMiddlewareWithConfig(config Config) echo.MiddlewareFunc {
+	mw, err := config.ToMiddleware()
+	if err != nil {
+		panic(err)
+	}
+	return mw
+}
+
+// ToMiddleware returns echo opentelemetry middleware which will trace incoming requests.
+func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
+	if config.TracerProvider == nil {
+		config.TracerProvider = otel.GetTracerProvider()
+	}
+	if config.Propagators == nil {
+		config.Propagators = otel.GetTextMapPropagator()
+	}
+	if config.MeterProvider == nil {
+		config.MeterProvider = otel.GetMeterProvider()
+	}
+	if config.Skipper == nil {
+		config.Skipper = middleware.DefaultSkipper
+	}
+	if config.OnError == nil {
+		config.OnError = func(c *echo.Context, err error) {
+			c.Logger().Error("otel middleware error", "error", err)
+		}
+	}
+
+	var serverHost string
+	var serverPort int
+	if config.ServerName != "" {
+		if host, port, sErr := extrator.SplitAddress(config.ServerName); sErr != nil {
+			return nil, fmt.Errorf("otel middleware failed to parse server name: %w", sErr)
+		} else {
+			serverHost = host
+			serverPort = port
+		}
+	}
+
+	tracer := config.TracerProvider.Tracer(
+		ScopeName,
+		oteltrace.WithInstrumentationVersion(Version),
+	)
+
+	meter := config.MeterProvider.Meter(
+		ScopeName,
+		metric.WithInstrumentationVersion(Version),
+	)
+
+	metrics, mErr := extrator.NewMetrics(meter)
+	if mErr != nil {
+		return nil, fmt.Errorf("otel middleware failed to create metrics: %w", mErr)
+	}
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			if config.Skipper(c) {
+				return next(c)
+			}
+
+			requestStartTime := time.Now()
+
+			c.Set(tracerKey, tracer)
+			request := c.Request()
+
+			ev := extrator.Values{
+				ServerAddress: serverHost,
+				ServerPort:    serverPort,
+				ClientAddress: c.RealIP(),
+			}
+			if err := ev.ExtractRequest(request); err != nil {
+				config.OnError(c, err)
+			}
+			spanAttributes := ev.SpanStartAttributes()
+			if config.SpanStartAttributes != nil {
+				spanAttributes = config.SpanStartAttributes(c, &ev, spanAttributes)
+			}
+
+			spanStartOptions := []oteltrace.SpanStartOption{
+				oteltrace.WithAttributes(spanAttributes...),
+				oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+			}
+			if config.SpanStartOptions != nil {
+				spanStartOptions = append(spanStartOptions, config.SpanStartOptions...)
+			}
+
+			ctx, span := tracer.Start(
+				config.Propagators.Extract(request.Context(), propagation.HeaderCarrier(request.Header)),
+				extrator.SpanNameFormatter(ev),
+				spanStartOptions...,
+			)
+			defer span.End()
+
+			// pass the span through the request context
+			spanRequest := request.WithContext(ctx)
+			c.SetRequest(spanRequest)
+			defer func() {
+				// as we have created new http.Request object we need to make sure that temporary files created to hold MultipartForm
+				// files are cleaned up. This is done by http.Server at the end of request lifecycle but Server does not
+				// have a reference to our new Request instance therefore it is our responsibility to fix the mess we caused.
+				//
+				// This means that when we are on returning path from handler middlewares up in chain from this middleware
+				// can not access these temporary files anymore because we deleted them here.
+				if spanRequest.MultipartForm != nil {
+					_ = spanRequest.MultipartForm.RemoveAll()
+				}
+			}()
+
+			// serve the request to the next middleware
+			err := next(c)
+			if err != nil {
+				span.SetAttributes(semconv.ErrorType(err))
+				span.SetStatus(codes.Error, err.Error())
+				config.OnError(c, err)
+			}
+
+			// In Echo, when there's an error, the HTTPErrorHandler hasn't written the response yet,
+			// so we need to determine the status from the error itself or from the Response
+			resp, _ := echo.UnwrapResponse(c.Response())
+			if resp != nil {
+				ev.HTTPResponseBodySize = resp.Size
+			}
+
+			status := http.StatusOK
+			if err != nil {
+				var sc echo.HTTPStatusCoder
+				if errors.As(err, &sc) {
+					status = sc.StatusCode()
+				}
+				if resp != nil && resp.Committed {
+					status = resp.Status
+				}
+				if status == 0 {
+					status = http.StatusInternalServerError
+				}
+			}
+			ev.HTTPResponseStatusCode = status
+
+			endAttributes := ev.SpanEndAttributes()
+			if config.SpanEndAttributes != nil {
+				endAttributes = config.SpanEndAttributes(c, &ev, endAttributes)
+			}
+			span.SetAttributes(endAttributes...)
+
+			// Record the server-side attributes.
+			iv := extrator.IncrementValues{
+				RequestDuration: time.Since(requestStartTime),
+				RequestSize:     ev.HTTPRequestBodySize,
+				ResponseSize:    ev.HTTPResponseBodySize,
+				Attributes:      ev.MetricAttributes(),
+			}
+			if config.MetricAttributes != nil {
+				iv.Attributes = config.MetricAttributes(c, &ev, endAttributes)
+			}
+			metrics.Increment(c.Request().Context(), iv)
+
+			return err
+		}
+	}, nil
+}
