@@ -1,4 +1,4 @@
-package extrator
+package echootel
 
 import (
 	"context"
@@ -19,18 +19,22 @@ import (
 // Metrics holds a standard set of OpenTelemetry global request/response metrics
 type Metrics struct {
 	// requestDurationHistogram (`http.server.request.duration`) is the duration of HTTP server requests.
+	// Unit (UCUM): S (seconds)
 	// Spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverrequestduration
 	requestDurationHistogram httpconv.ServerRequestDuration //  required
 
 	// requestBodySizeHistogram (`http.server.request.body.size`) is size of HTTP server request bodies.
+	// Unit (UCUM): By (bytes)
 	// Spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverrequestbodysize
 	requestBodySizeHistogram httpconv.ServerRequestBodySize // optional
 
 	// responseBodySizeHistogram (`http.server.response.body.size`) is size of HTTP server response bodies.
+	// Unit (UCUM): By (bytes)
 	// Spec: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverresponsebodysize
 	responseBodySizeHistogram httpconv.ServerResponseBodySize // optional
 }
 
+// NewMetrics creates a new Metrics instance for Standard Required metric instances with the given Meter.
 func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	// required, https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverrequestduration
 	reqDuration, err := httpconv.NewServerRequestDuration(
@@ -60,17 +64,26 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	}, nil
 }
 
+// IncrementValues represents the values to be used for Increment method.
 type IncrementValues struct {
+	// RequestDuration is the duration of request processing. Will be used with `http.server.request.duration` metric.
 	RequestDuration time.Duration
-	RequestSize     int64
-	ResponseSize    int64
-	Attributes      []attribute.KeyValue
+
+	// RequestSize is the size of the request body in bytes. Will be used with `http.server.request.body.size` metric.
+	RequestSize int64
+
+	// ResponseSize is the size of the response body in bytes. Will be used with `http.server.response.body.size` metric.
+	ResponseSize int64
+
+	// Attributes are additional attributes to be used for incremented metrics.
+	Attributes []attribute.KeyValue
 }
 
+// Increment records the given IncrementValues to the Metrics instance.
 func (m *Metrics) Increment(ctx context.Context, v IncrementValues) {
 	o := metric.WithAttributeSet(attribute.NewSet(v.Attributes...))
 
-	m.requestDurationHistogram.Inst().Record(ctx, float64(v.RequestDuration.Milliseconds()), o)
+	m.requestDurationHistogram.Inst().Record(ctx, v.RequestDuration.Seconds(), o)
 	m.requestBodySizeHistogram.Inst().Record(ctx, v.RequestSize, o)
 	m.responseBodySizeHistogram.Inst().Record(ctx, v.ResponseSize, o)
 }
@@ -268,6 +281,7 @@ type Values struct {
 	HTTPRequestBodySize int64 // metric
 }
 
+// ExtractRequest extracts values from the given HTTP request and populates the Values struct.
 func (v *Values) ExtractRequest(r *http.Request) error {
 	var errs []error
 
@@ -283,10 +297,12 @@ func (v *Values) ExtractRequest(r *http.Request) error {
 			v.ServerPort = port
 		}
 	}
+	if v.HTTPRoute == "" {
+		v.HTTPRoute = r.Pattern
+	}
 
 	v.HTTPMethod, v.HTTPMethodOriginal = httpMethod(r.Method)
 	v.HTTPRequestBodySize = r.ContentLength // Note: this value can be -1 indicating unknown body size
-	v.HTTPRoute = r.Pattern
 	v.URLPath = r.URL.Path
 	v.UserAgentOriginal = r.UserAgent()
 
@@ -300,7 +316,7 @@ func (v *Values) ExtractRequest(r *http.Request) error {
 	v.NetworkProtocolName, v.NetworkProtocolVersion = splitProto(r.Proto)
 
 	// The HTTP server sets Request.RemoteAddr to an "IP:port" address.
-	peerAddr, peerPort, err := splitHostPort(r.RemoteAddr)
+	peerAddr, peerPort, err := SplitAddress(r.RemoteAddr)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("failed to split Request.RemoteAddr: %w", err))
 	}
@@ -319,6 +335,7 @@ func (v *Values) ExtractRequest(r *http.Request) error {
 	return nil
 }
 
+// SpanStartAttributes returns a list of attributes to be used when starting a span.
 func (v *Values) SpanStartAttributes() []attribute.KeyValue {
 	result := v.commonAttributes(5)
 	if v.NetworkPeerAddress != "" {
@@ -333,7 +350,6 @@ func (v *Values) SpanStartAttributes() []attribute.KeyValue {
 	if v.UserAgentOriginal != "" {
 		result = append(result, semconv.UserAgentOriginal(v.UserAgentOriginal))
 	}
-
 	if v.URLPath != "" {
 		result = append(result, semconv.URLPath(v.URLPath))
 	}
@@ -414,29 +430,18 @@ const (
 	otherMethod = "_OTHER"
 )
 
-// SplitAddress splits server address or host into host (`server.address`) and port (`server.port`).
-// Port is part is not mandatory in address and can be omitted.
-func SplitAddress(address string) (host string, port int, err error) {
-	if i := strings.LastIndexByte(address, ':'); i < 0 {
-		return address, 0, nil
+// httpMethod derives values for `http.request.method` and `http.request.method_original` attributes from a given value.
+func httpMethod(method string) (string, string) {
+	if _, ok := knownMethods[method]; ok {
+		return method, ""
 	}
-	// address is probably in the form of "host:port", "host%zone:port", "[host]:port" or "[host%zone]:port"
-	return splitHostPort(address)
-}
-
-// splitHostPort splits server host:port string into host (`server.address`) and port (`server.port`).
-// Address can be in the form of "host", "host%zone", "[host]", "[host%zone], "host:port", "host%zone:port",
-// "[host]:port", "[host%zone]:port".
-func splitHostPort(address string) (host string, port int, err error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", 0, err
+	originalMethod := method
+	method = otherMethod
+	upperMethod := strings.ToUpper(originalMethod)
+	if _, ok := knownMethods[upperMethod]; ok {
+		method = upperMethod
 	}
-	port, err = strconv.Atoi(portStr)
-	if err != nil {
-		err = fmt.Errorf("failed to parse port: %w", err)
-	}
-	return host, port, err
+	return method, originalMethod
 }
 
 // returns network protocol (`network.protocol.name`) name and version (`network.protocol.version`).
@@ -455,18 +460,39 @@ func splitProto(proto string) (name string, version string) {
 	return name, version
 }
 
-// httpMethod derives values for `http.request.method` and `http.request.method_original` attributes from a given value.
-func httpMethod(method string) (string, string) {
-	if _, ok := knownMethods[method]; ok {
-		return method, ""
+// splitHostPort splits server host:port string into host (`server.address`) and port (`server.port`).
+// Address can be in the form of "host", "host%zone", "[host]", "[host%zone], "host:port", "host%zone:port",
+// "[host]:port", "[host%zone]:port".
+func splitHostPort(address string) (host string, port int, err error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", 0, err
 	}
-	originalMethod := method
-	method = otherMethod
-	upperMethod := strings.ToUpper(originalMethod)
-	if _, ok := knownMethods[upperMethod]; ok {
-		method = upperMethod
+	port, err = strconv.Atoi(portStr)
+	if err != nil {
+		err = fmt.Errorf("failed to parse port: %w", err)
 	}
-	return method, originalMethod
+	return host, port, err
+}
+
+// SplitAddress splits server address or host into host (`server.address`) and port (`server.port`).
+// Empty address is accepted and returns empty host and port.
+// Port is part is not mandatory in address and can be omitted.
+func SplitAddress(address string) (host string, port int, err error) {
+	if address == "" {
+		return "", 0, nil
+	}
+	lastColon := strings.LastIndexByte(address, ':')
+	if lastColon < 0 {
+		return address, 0, nil
+	}
+	lastEndBracket := strings.LastIndexByte(address, ']')
+	if lastEndBracket > 0 && lastColon < lastEndBracket { // `[fe80::1]` but not `[fe80::1]:80`
+		address += ":0" // for IPv6, add port so `net.SplitHostPort` could validate host port
+	}
+
+	// address is probably in the form of "host:port", "host%zone:port", "[host]:port" or "[host%zone]:port"
+	return splitHostPort(address)
 }
 
 // SpanNameFormatter returns the default format for the span name based on the HTTP method and path.

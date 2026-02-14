@@ -6,7 +6,7 @@ replace github.com/labstack/echo-contrib/echootel => ../
 
 require (
 	github.com/labstack/echo-contrib/echootel v0.0.0-00010101000000-000000000000
-	github.com/labstack/echo/v5 v5.0.3
+	github.com/labstack/echo/v5 v5.0.4-0.20260214153944-a260cf5d7f3b
 	go.opentelemetry.io/otel v1.40.0
 	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.40.0
 	go.opentelemetry.io/otel/sdk v1.40.0

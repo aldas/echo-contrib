@@ -1,12 +1,9 @@
 package echootel
 
 import (
-	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
-	"github.com/labstack/echo-contrib/otelecho/extrator"
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
 	"go.opentelemetry.io/otel"
@@ -25,7 +22,7 @@ import (
 const Version = "5.0.0"
 
 const (
-	tracerKey = "labstack-echo-otelecho-tracer"
+	TracerKey = "labstack-echo-otelecho-tracer"
 	// ScopeName is the instrumentation scope name.
 	ScopeName = "github.com/labstack/echo-contrib/echootel"
 )
@@ -79,7 +76,7 @@ type Config struct {
 
 // AttributesFunc is used to extract additional attributes from the echo.Context
 // and return them as a slice of attribute.KeyValue.
-type AttributesFunc func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue
+type AttributesFunc func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue
 
 // OnErrorFunc is used to specify how errors are handled in the middleware.
 type OnErrorFunc func(c *echo.Context, err error)
@@ -119,7 +116,7 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 	var serverHost string
 	var serverPort int
 	if config.ServerName != "" {
-		if host, port, sErr := extrator.SplitAddress(config.ServerName); sErr != nil {
+		if host, port, sErr := SplitAddress(config.ServerName); sErr != nil {
 			return nil, fmt.Errorf("otel middleware failed to parse server name: %w", sErr)
 		} else {
 			serverHost = host
@@ -137,7 +134,7 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 		metric.WithInstrumentationVersion(Version),
 	)
 
-	metrics, mErr := extrator.NewMetrics(meter)
+	metrics, mErr := NewMetrics(meter)
 	if mErr != nil {
 		return nil, fmt.Errorf("otel middleware failed to create metrics: %w", mErr)
 	}
@@ -150,10 +147,10 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 
 			requestStartTime := time.Now()
 
-			c.Set(tracerKey, tracer)
+			c.Set(TracerKey, tracer)
 			request := c.Request()
 
-			ev := extrator.Values{
+			ev := Values{
 				ServerAddress: serverHost,
 				ServerPort:    serverPort,
 				ClientAddress: c.RealIP(),
@@ -176,7 +173,7 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 
 			ctx, span := tracer.Start(
 				config.Propagators.Extract(request.Context(), propagation.HeaderCarrier(request.Header)),
-				extrator.SpanNameFormatter(ev),
+				SpanNameFormatter(ev),
 				spanStartOptions...,
 			)
 			defer span.End()
@@ -206,25 +203,11 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 
 			// In Echo, when there's an error, the HTTPErrorHandler hasn't written the response yet,
 			// so we need to determine the status from the error itself or from the Response
-			resp, _ := echo.UnwrapResponse(c.Response())
+			resp, status := echo.ResolveResponseStatus(c.Response(), err)
+			ev.HTTPResponseStatusCode = status
 			if resp != nil {
 				ev.HTTPResponseBodySize = resp.Size
 			}
-
-			status := http.StatusOK
-			if err != nil {
-				var sc echo.HTTPStatusCoder
-				if errors.As(err, &sc) {
-					status = sc.StatusCode()
-				}
-				if resp != nil && resp.Committed {
-					status = resp.Status
-				}
-				if status == 0 {
-					status = http.StatusInternalServerError
-				}
-			}
-			ev.HTTPResponseStatusCode = status
 
 			endAttributes := ev.SpanEndAttributes()
 			if config.SpanEndAttributes != nil {
@@ -233,14 +216,14 @@ func (config Config) ToMiddleware() (echo.MiddlewareFunc, error) {
 			span.SetAttributes(endAttributes...)
 
 			// Record the server-side attributes.
-			iv := extrator.IncrementValues{
+			iv := IncrementValues{
 				RequestDuration: time.Since(requestStartTime),
 				RequestSize:     ev.HTTPRequestBodySize,
 				ResponseSize:    ev.HTTPResponseBodySize,
 				Attributes:      ev.MetricAttributes(),
 			}
 			if config.MetricAttributes != nil {
-				iv.Attributes = config.MetricAttributes(c, &ev, endAttributes)
+				iv.Attributes = config.MetricAttributes(c, &ev, iv.Attributes)
 			}
 			metrics.Increment(c.Request().Context(), iv)
 

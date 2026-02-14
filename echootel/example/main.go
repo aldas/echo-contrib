@@ -51,11 +51,11 @@ func main() {
 			slog.Error("Failed to shutdown tracer provider", "error", err)
 		}
 	}()
-	echoTracer := tp.Tracer("echo-server")
 
 	e := echo.New()
 	e.Use(echootel.NewMiddlewareWithConfig(echootel.Config{
-		ServerName: "my-server",
+		ServerName:     "my-server",
+		TracerProvider: tp,
 		OnError: func(c *echo.Context, err error) {
 			e.Logger.Error("otel middleware", "error", err)
 		},
@@ -66,7 +66,7 @@ func main() {
 			ID:   c.Param("id"),
 			Name: "",
 		}
-		u.Name = traceGetUser(echoTracer, c.Request().Context(), u.ID)
+		u.Name, _ = traceGetUser(c, u.ID)
 		return c.JSON(http.StatusOK, u)
 	})
 	if err := e.Start(":8080"); err != nil {
@@ -88,11 +88,16 @@ func initTracer() (*sdktrace.TracerProvider, error) {
 	return tp, nil
 }
 
-func traceGetUser(tp trace.Tracer, ctx context.Context, id string) string {
-	_, span := tp.Start(ctx, "getUser", trace.WithAttributes(attribute.String("id", id)))
+func traceGetUser(c *echo.Context, id string) (string, error) {
+	tp, err := echo.ContextGet[trace.Tracer](c, echootel.TracerKey)
+	if err != nil {
+		return "", err
+	}
+
+	_, span := tp.Start(c.Request().Context(), "getUser", trace.WithAttributes(attribute.String("id", id)))
 	defer span.End()
 	if id == "123" {
-		return "otelecho tester"
+		return "otelecho tester", nil
 	}
-	return "unknown"
+	return "unknown", nil
 }

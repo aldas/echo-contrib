@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo-contrib/otelecho/extrator"
 	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,21 +135,17 @@ func TestMetrics(t *testing.T) {
 			wantStatus:    200,
 		},
 		{
-			// Note: In Echo v5, when a route is not found, the error type returned
-			// may not be *echo.HTTPError, so the middleware falls back to 500.
-			// The actual HTTP response to the client is still 404 (handled by HTTPErrorHandler),
-			// but the middleware captures the error status before HTTPErrorHandler runs.
 			name:          "request target not exist",
 			requestTarget: "/abc/123",
-			wantStatus:    500,
+			wantStatus:    404,
 		},
 		{
 			name: "with metric attributes callback",
 			givenConfig: Config{
-				SpanStartAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
-					return append(attr, attribute.String("key3", "value3"))
+				SpanStartAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
+					return append(attr, attribute.String("key3", "value3")) // these are not used
 				},
-				MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+				MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
 					return append(attr,
 						attribute.String("key1", "value1"),
 						attribute.String("key2", "value"),
@@ -170,7 +165,7 @@ func TestMetrics(t *testing.T) {
 			meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 
 			config := tt.givenConfig
-			if config.ServerName != "" {
+			if config.ServerName == "" {
 				config.ServerName = "foobar"
 			}
 			if config.MeterProvider == nil {
@@ -213,13 +208,22 @@ func TestMetrics(t *testing.T) {
 			c := e.NewContext(r, w)
 
 			if tt.givenConfig.MetricAttributes != nil {
-				attrs = append(attrs, tt.givenConfig.MetricAttributes(c, &extrator.Values{}, attrs)...)
+				attrs = tt.givenConfig.MetricAttributes(c, &Values{}, attrs)
 			}
-			if tt.givenConfig.SpanStartAttributes != nil {
-				// In Echo v5, we don't need to create a mock context
-				// The attributes are already extracted during the actual request
-				attrs = append(attrs, attribute.String("key3", "value3"))
-			}
+
+			metricdatatest.AssertEqual(t, metricdata.Metrics{
+				Name:        "http.server.request.duration",
+				Description: "Duration of HTTP server requests.",
+				Unit:        "s",
+				Data: metricdata.Histogram[float64]{
+					Temporality: metricdata.CumulativeTemporality,
+					DataPoints: []metricdata.HistogramDataPoint[float64]{
+						{
+							Attributes: attribute.NewSet(attrs...),
+						},
+					},
+				},
+			}, sm.Metrics[0], metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreValue(), metricdatatest.IgnoreExemplars())
 
 			metricdatatest.AssertEqual(t, metricdata.Metrics{
 				Name:        "http.server.request.body.size",
@@ -233,7 +237,7 @@ func TestMetrics(t *testing.T) {
 						},
 					},
 				},
-			}, sm.Metrics[0], metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreValue(), metricdatatest.IgnoreExemplars())
+			}, sm.Metrics[1], metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreValue(), metricdatatest.IgnoreExemplars())
 
 			metricdatatest.AssertEqual(t, metricdata.Metrics{
 				Name:        "http.server.response.body.size",
@@ -242,20 +246,6 @@ func TestMetrics(t *testing.T) {
 				Data: metricdata.Histogram[int64]{
 					Temporality: metricdata.CumulativeTemporality,
 					DataPoints: []metricdata.HistogramDataPoint[int64]{
-						{
-							Attributes: attribute.NewSet(attrs...),
-						},
-					},
-				},
-			}, sm.Metrics[1], metricdatatest.IgnoreTimestamp(), metricdatatest.IgnoreValue(), metricdatatest.IgnoreExemplars())
-
-			metricdatatest.AssertEqual(t, metricdata.Metrics{
-				Name:        "http.server.request.duration",
-				Description: "Duration of HTTP server requests.",
-				Unit:        "s",
-				Data: metricdata.Histogram[float64]{
-					Temporality: metricdata.CumulativeTemporality,
-					DataPoints: []metricdata.HistogramDataPoint[float64]{
 						{
 							Attributes: attribute.NewSet(attrs...),
 						},
@@ -274,7 +264,7 @@ func TestWithMetricAttributeFn(t *testing.T) {
 	e.Use(NewMiddlewareWithConfig(Config{
 		ServerName:    "test-service",
 		MeterProvider: meterProvider,
-		MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+		MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
 			attr = append(
 				attr,
 				attribute.String("custom.header", c.Request().Header.Get("X-Test-Header")),
@@ -327,7 +317,7 @@ func TestWithEchoMetricAttributeFn(t *testing.T) {
 	e.Use(NewMiddlewareWithConfig(Config{
 		ServerName:    "test-service",
 		MeterProvider: meterProvider,
-		MetricAttributes: func(c *echo.Context, v *extrator.Values, attr []attribute.KeyValue) []attribute.KeyValue {
+		MetricAttributes: func(c *echo.Context, v *Values, attr []attribute.KeyValue) []attribute.KeyValue {
 			attr = append(
 				attr,
 				// This is just for testing. Avoid high cardinality metrics such as "id" in production code
